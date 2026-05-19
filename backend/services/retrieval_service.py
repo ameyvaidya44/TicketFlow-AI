@@ -3,11 +3,22 @@ services/retrieval_service.py — Agent 2: ChromaDB vector retrieval.
 
 Queries the vector database for similar resolved tickets.
 Returns top-3 most similar past cases with solutions and similarity scores.
+
+Redis caching: ChromaDB similarity search results are cached in Upstash Redis
+(same instance as the NLP and embedding caches) using key format:
+  retrieval:{embedding_hash}:{category}:{top_k}:{status_filter}
+TTL is intentionally short (10 minutes) because the vector DB contents change
+as new tickets are resolved. ChromaDB remains the source of truth; Redis is
+only a performance layer. All Redis failures fall through silently.
 """
 
 import asyncio
+import hashlib
+import json
+import numpy as np
 from typing import List, Dict, Optional
 from loguru import logger
+from urllib.parse import quote
 
 from core.config import settings
 from services.embedding_service import embedding_service
@@ -26,13 +37,159 @@ class RetrievalService:
     Collections:
     - resolved_tickets: past tickets with solutions (for RAG)
     - knowledge_articles: auto-generated KB articles
+
+    Caching:
+    - Retrieval results are cached in Upstash Redis (TTL: 10 minutes)
+    - Cache key encodes embedding hash + query parameters
+    - Cache misses fall through to ChromaDB transparently
     """
+
+    # TTL for cached retrieval results: 10 minutes
+    # Short because ChromaDB contents change as tickets are resolved.
+    _RETRIEVAL_TTL = 600
 
     def __init__(self):
         self._client = None
         self._tickets_collection = None
         self._articles_collection = None
         self._initialized = False
+
+        # Reuse the same Upstash Redis instance as nlp_cache and embedding_service
+        self._cache_enabled = False
+        self._http_client = None
+        if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
+            try:
+                import httpx
+                self._http_client = httpx.AsyncClient()
+                self._cache_enabled = True
+                logger.info("Retrieval cache: Upstash Redis enabled")
+            except ImportError:
+                logger.warning("httpx not installed. Retrieval cache disabled.")
+        else:
+            logger.warning(
+                "Upstash credentials not configured. Retrieval cache disabled."
+            )
+
+    # ── Retrieval cache helpers ───────────────────────────────────────
+
+    def _retrieval_cache_key(
+        self,
+        embedding: list,
+        category: Optional[str],
+        top_k: int,
+        status_filter: str,
+    ) -> str:
+        """
+        Build a deterministic Redis key from the embedding vector and query params.
+
+        The embedding is hashed (MD5 of its JSON representation) so the key is
+        compact and consistent regardless of floating-point representation order.
+        Query parameters are appended so different filter combinations never
+        collide on the same key.
+
+        Format: retrieval:{embedding_md5}:{category}:{top_k}:{status_filter}
+        """
+        embedding_bytes = json.dumps(embedding, separators=(",", ":")).encode("utf-8")
+        embedding_hash = hashlib.md5(embedding_bytes).hexdigest()
+        cat_part = category if category else "none"
+        return f"retrieval:{embedding_hash}:{cat_part}:{top_k}:{status_filter}"
+
+    async def _retrieval_cache_get(
+        self,
+        embedding: list,
+        category: Optional[str],
+        top_k: int,
+        status_filter: str,
+    ) -> Optional[List[Dict]]:
+        """
+        Fetch retrieval results from Upstash Redis.
+
+        Returns:
+            List of similar-ticket dicts on cache hit, None on miss or error.
+        """
+        if not self._cache_enabled or not self._http_client:
+            return None
+
+        key = self._retrieval_cache_key(embedding, category, top_k, status_filter)
+        url = f"{settings.UPSTASH_REDIS_REST_URL}/get/{key}"
+        headers = {"Authorization": f"Bearer {settings.UPSTASH_REDIS_REST_TOKEN}"}
+
+        try:
+            response = await self._http_client.get(url, headers=headers, timeout=5.0)
+            if response.status_code == 200:
+                data = response.json()
+                result_value = data.get("result")
+                if result_value:
+                    try:
+                        parsed = json.loads(result_value)
+                        logger.debug(f"Retrieval cache HIT  key={key}")
+                        return parsed
+                    except (json.JSONDecodeError, TypeError, ValueError) as e:
+                        logger.warning(
+                            f"Retrieval cache: could not deserialize {key}: {e}"
+                        )
+                        return None
+            logger.debug(f"Retrieval cache MISS key={key}")
+            return None
+        except asyncio.TimeoutError:
+            logger.warning("Retrieval cache GET timeout")
+            return None
+        except Exception as e:
+            logger.warning(f"Retrieval cache GET error: {e}")
+            return None
+
+    async def _retrieval_cache_set(
+        self,
+        embedding: list,
+        category: Optional[str],
+        top_k: int,
+        status_filter: str,
+        results: List[Dict],
+    ) -> bool:
+        """
+        Store retrieval results in Upstash Redis as a JSON array.
+
+        Args:
+            embedding: The query embedding list (used to derive the key).
+            category: Category filter used in the query.
+            top_k: Number of results requested.
+            status_filter: Status filter used in the query.
+            results: List of similar-ticket dicts to cache.
+
+        Returns:
+            True if stored successfully.
+        """
+        if not self._cache_enabled or not self._http_client:
+            return False
+
+        key = self._retrieval_cache_key(embedding, category, top_k, status_filter)
+        json_value = json.dumps(results)
+        encoded_value = quote(json_value)
+        url = f"{settings.UPSTASH_REDIS_REST_URL}/set/{key}/{encoded_value}"
+        headers = {"Authorization": f"Bearer {settings.UPSTASH_REDIS_REST_TOKEN}"}
+        params = {"EX": self._RETRIEVAL_TTL}
+
+        try:
+            response = await self._http_client.get(
+                url, headers=headers, params=params, timeout=5.0
+            )
+            if response.status_code == 200:
+                logger.debug(
+                    f"Retrieval cache STORE key={key} ttl={self._RETRIEVAL_TTL}s"
+                )
+                return True
+            logger.warning(
+                f"Retrieval cache SET failed (status {response.status_code})"
+            )
+            return False
+        except asyncio.TimeoutError:
+            logger.warning("Retrieval cache SET timeout")
+            return False
+        except Exception as e:
+            logger.warning(f"Retrieval cache SET error: {e}")
+            return False
+
+    # ── ChromaDB client ───────────────────────────────────────────────
 
     def _init_client(self):
         """Initialize ChromaDB client (lazy, called on first use)."""
@@ -214,6 +371,55 @@ class RetrievalService:
             logger.error(f"ChromaDB query error: {e}")
             return []
 
+    async def _query_similar_cached(
+        self,
+        embedding_list: list,
+        category: Optional[str],
+        top_k: int,
+        status_filter: str = "resolved",
+    ) -> List[Dict]:
+        """
+        Cache-aware wrapper around _query_similar.
+
+        Flow:
+          1. Check Upstash Redis for cached results.
+          2. On hit: return cached list immediately (ChromaDB skipped).
+          3. On miss: run ChromaDB query in thread pool.
+          4. Store results in Redis (fire-and-forget).
+          5. Return results.
+
+        Redis failures at any step fall through silently; ChromaDB is always
+        the authoritative source of truth.
+        """
+        # 1. Cache lookup
+        cached = await self._retrieval_cache_get(
+            embedding_list, category, top_k, status_filter
+        )
+        if cached is not None:
+            return cached
+
+        # 2. Cache miss — query ChromaDB
+        logger.debug(
+            f"Retrieval cache MISS — querying ChromaDB "
+            f"(category={category}, top_k={top_k}, status={status_filter})"
+        )
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(
+            None,
+            lambda: self._query_similar(
+                embedding_list, category, top_k, status_filter
+            ),
+        )
+
+        # 3. Store in Redis (fire-and-forget; never block the caller)
+        asyncio.ensure_future(
+            self._retrieval_cache_set(
+                embedding_list, category, top_k, status_filter, results
+            )
+        )
+
+        return results
+
     async def find_similar_tickets(
         self,
         text: str,
@@ -231,20 +437,19 @@ class RetrievalService:
         Returns:
             Agent 2 output dict matching pipeline spec.
         """
-        # Generate embedding
+        # Generate embedding (hits embedding cache if available)
         embedding = await embedding_service.embed_async(text)
         embedding_list = embedding_service.embedding_to_list(embedding)
 
-        # Run ChromaDB query in thread pool
-        loop = asyncio.get_event_loop()
-        similar = await loop.run_in_executor(
-            None, lambda: self._query_similar(embedding_list, category, top_k)
+        # Cache-aware ChromaDB query (category-filtered)
+        similar = await self._query_similar_cached(
+            embedding_list, category, top_k, status_filter="resolved"
         )
 
-        # If category-filtered query returned no results, try without filter
+        # If category-filtered query returned no results, retry without filter
         if not similar and category:
-            similar = await loop.run_in_executor(
-                None, lambda: self._query_similar(embedding_list, None, top_k)
+            similar = await self._query_similar_cached(
+                embedding_list, None, top_k, status_filter="resolved"
             )
 
         top_score = similar[0]["similarity_score"] if similar else 0.0
@@ -271,19 +476,18 @@ class RetrievalService:
         """
         Query for similar OPEN tickets (used for duplicate detection).
         Returns all open tickets with similarity > 0.5.
+
+        Note: open-ticket queries are also cached (same 10-minute TTL) so
+        rapid duplicate checks on the same text don't hammer ChromaDB.
         """
         embedding = await embedding_service.embed_async(text)
         embedding_list = embedding_service.embedding_to_list(embedding)
 
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: self._query_similar(
-                embedding_list,
-                category=None,
-                top_k=10,
-                status_filter="open",
-            ),
+        return await self._query_similar_cached(
+            embedding_list,
+            category=None,
+            top_k=10,
+            status_filter="open",
         )
 
     async def add_knowledge_article(
