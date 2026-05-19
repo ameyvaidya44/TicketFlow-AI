@@ -41,6 +41,7 @@ class TicketCategory(str, Enum):
 class RoutingDecision(str, Enum):
     AUTO_RESOLVE = "AUTO_RESOLVE"
     SUGGEST_TO_AGENT = "SUGGEST_TO_AGENT"
+    ESCALATE_TO_AGENT = "ESCALATE_TO_AGENT"
     ESCALATE_TO_HUMAN = "ESCALATE_TO_HUMAN"
 
 

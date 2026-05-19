@@ -64,6 +64,7 @@ export default function SubmitTicket() {
     const routingMsg = {
       AUTO_RESOLVE:      { icon: CheckCircle2, color: "emerald", msg: "Your ticket was automatically resolved by AI!" },
       SUGGEST_TO_AGENT:  { icon: Clock,        color: "amber",   msg: "An agent will review the AI suggestion shortly." },
+      ESCALATE_TO_AGENT: { icon: AlertTriangle, color: "orange", msg: "An agent will handle this ticket directly." },
       ESCALATE_TO_HUMAN: { icon: AlertTriangle, color: "red",    msg: "This has been escalated to a human specialist." },
     }[routing] || {};
     const Icon = routingMsg.icon || Zap;
@@ -126,7 +127,7 @@ export default function SubmitTicket() {
         </div>
 
         {/* Generated response */}
-        {ai.generated_response && (
+        {ai.generated_response ? (
           <div className="card">
             <h3 className="text-sm font-semibold text-gray-200 mb-3">AI Generated Response</h3>
             <div className="bg-surface rounded-xl p-4 border border-surface-border">
@@ -137,6 +138,20 @@ export default function SubmitTicket() {
             {ai.fallback_used && (
               <p className="text-xs text-amber-400 mt-2">⚠ Retrieved from knowledge base (LLM unavailable)</p>
             )}
+          </div>
+        ) : (
+          <div className="card border-surface-border">
+            <h3 className="text-sm font-semibold text-gray-200 mb-3">AI Generated Response</h3>
+            <div className="bg-surface rounded-xl p-4 border border-surface-border flex items-start gap-3">
+              <AlertTriangle size={16} className="text-amber-400 mt-0.5 shrink-0" />
+              <p className="text-sm text-gray-400 leading-relaxed">
+                {routing === "ESCALATE_TO_HUMAN"
+                  ? "This ticket requires specialist review. A human agent will respond with a tailored solution."
+                  : routing === "ESCALATE_TO_AGENT"
+                  ? "AI confidence was insufficient to auto-generate a response. An agent will handle this directly."
+                  : "AI response is being processed. Check back on the ticket detail page shortly."}
+              </p>
+            </div>
           </div>
         )}
 

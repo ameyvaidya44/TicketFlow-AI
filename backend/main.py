@@ -126,6 +126,16 @@ async def check_sla_warnings():
             if not created_at:
                 continue
 
+            # MongoDB may return created_at as a string — parse it to datetime
+            if isinstance(created_at, str):
+                try:
+                    created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+            # Ensure timezone-aware
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+
             sla_info = sla_service.get_sla_info(category, priority, created_at)
             mins_left = sla_info["minutes_remaining"]
 

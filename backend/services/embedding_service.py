@@ -1,12 +1,20 @@
 """
 services/embedding_service.py — Sentence transformer embedding generation.
 Produces 384-dimensional vectors for ChromaDB and similarity computation.
+
+Redis caching: embedding vectors are cached in Upstash Redis (same instance
+as the NLP preprocessing cache) using key format `embedding:{md5_hash}` with
+a 7-day TTL. This avoids re-running Sentence Transformer inference for
+repeated ticket texts.
 """
 
 import asyncio
+import hashlib
+import json
 import numpy as np
 from typing import List, Optional
 from loguru import logger
+from urllib.parse import quote
 
 from core.config import settings
 
@@ -18,11 +26,118 @@ class EmbeddingService:
     - Lazy-loaded on first use to avoid slow startup
     - Thread-safe singleton model instance
     - Async wrappers to avoid blocking FastAPI event loop
+    - Upstash Redis caching for embedding vectors (7-day TTL)
     """
+
+    # TTL for cached embeddings: 7 days
+    _EMBEDDING_TTL = 604800
 
     def __init__(self):
         self._model = None
         self._model_name = settings.EMBEDDING_MODEL  # "all-MiniLM-L6-v2"
+
+        # Reuse the same Upstash Redis instance as nlp_cache
+        self._cache_enabled = False
+        self._http_client = None
+        if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
+            try:
+                import httpx
+                self._http_client = httpx.AsyncClient()
+                self._cache_enabled = True
+                logger.info("Embedding cache: Upstash Redis enabled")
+            except ImportError:
+                logger.warning("httpx not installed. Embedding cache disabled.")
+        else:
+            logger.warning(
+                "Upstash credentials not configured. Embedding cache disabled."
+            )
+
+    # ── Cache helpers ─────────────────────────────────────────────────
+
+    def _cache_key(self, text: str) -> str:
+        """Deterministic Redis key for a given text."""
+        text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
+        return f"embedding:{text_hash}"
+
+    async def _cache_get(self, text: str) -> Optional[np.ndarray]:
+        """
+        Fetch embedding from Upstash Redis.
+
+        Returns:
+            np.ndarray if cache hit, None otherwise.
+        """
+        if not self._cache_enabled or not self._http_client:
+            return None
+
+        key = self._cache_key(text)
+        url = f"{settings.UPSTASH_REDIS_REST_URL}/get/{key}"
+        headers = {"Authorization": f"Bearer {settings.UPSTASH_REDIS_REST_TOKEN}"}
+
+        try:
+            response = await self._http_client.get(url, headers=headers, timeout=5.0)
+            if response.status_code == 200:
+                data = response.json()
+                result_value = data.get("result")
+                if result_value:
+                    try:
+                        float_list = json.loads(result_value)
+                        embedding = np.array(float_list, dtype=np.float32)
+                        logger.debug(f"Embedding cache HIT  key={key}")
+                        return embedding
+                    except (json.JSONDecodeError, TypeError, ValueError) as e:
+                        logger.warning(
+                            f"Embedding cache: could not deserialize {key}: {e}"
+                        )
+                        return None
+            logger.debug(f"Embedding cache MISS key={key}")
+            return None
+        except asyncio.TimeoutError:
+            logger.warning("Embedding cache GET timeout")
+            return None
+        except Exception as e:
+            logger.warning(f"Embedding cache GET error: {e}")
+            return None
+
+    async def _cache_set(self, text: str, embedding: np.ndarray) -> bool:
+        """
+        Store embedding in Upstash Redis as a JSON float array.
+
+        Args:
+            text: Original text (used to derive the key).
+            embedding: numpy array to cache.
+
+        Returns:
+            True if stored successfully.
+        """
+        if not self._cache_enabled or not self._http_client:
+            return False
+
+        key = self._cache_key(text)
+        json_value = json.dumps(embedding.flatten().tolist())
+        encoded_value = quote(json_value)
+        url = f"{settings.UPSTASH_REDIS_REST_URL}/set/{key}/{encoded_value}"
+        headers = {"Authorization": f"Bearer {settings.UPSTASH_REDIS_REST_TOKEN}"}
+        params = {"EX": self._EMBEDDING_TTL}
+
+        try:
+            response = await self._http_client.get(
+                url, headers=headers, params=params, timeout=5.0
+            )
+            if response.status_code == 200:
+                logger.debug(
+                    f"Embedding cache STORE key={key} ttl={self._EMBEDDING_TTL}s"
+                )
+                return True
+            logger.warning(
+                f"Embedding cache SET failed (status {response.status_code})"
+            )
+            return False
+        except asyncio.TimeoutError:
+            logger.warning("Embedding cache SET timeout")
+            return False
+        except Exception as e:
+            logger.warning(f"Embedding cache SET error: {e}")
+            return False
 
     def _load_model(self):
         """Use TF-IDF fallback for speed. Real model loads in background after cache warms."""
@@ -125,9 +240,29 @@ class EmbeddingService:
         return embedding.flatten().tolist()
 
     async def embed_async(self, text: str) -> np.ndarray:
-        """Async wrapper — runs in thread pool to avoid blocking."""
+        """
+        Async embedding with Upstash Redis caching.
+
+        Flow:
+          1. Check Redis for a cached embedding (cache hit → return immediately).
+          2. On miss: generate embedding via Sentence Transformer in thread pool.
+          3. Store the new embedding in Redis for future requests.
+          4. Return the embedding.
+        """
+        # 1. Cache lookup
+        cached = await self._cache_get(text)
+        if cached is not None:
+            return cached
+
+        # 2. Generate embedding (CPU-bound — run in thread pool)
+        logger.debug("Embedding cache MISS — generating via Sentence Transformer")
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.embed, text)
+        embedding = await loop.run_in_executor(None, self.embed, text)
+
+        # 3. Store in Redis (fire-and-forget; don't block the caller on failure)
+        asyncio.ensure_future(self._cache_set(text, embedding))
+
+        return embedding
 
     async def embed_batch_async(self, texts: List[str]) -> np.ndarray:
         """Async batch embedding."""
