@@ -30,11 +30,15 @@ async def lifespan(app: FastAPI):
     logger.info("MongoDB connected and indexes created.")
 
     # 2. Display LLM Provider Configuration
-    if settings.LLM_PROVIDER.lower() == "ollama":
+    resolved = settings.resolved_llm_provider
+    if resolved == "cerebras":
+        logger.info(f"🤖 LLM provider: Cerebras (cloud)")
+        logger.info(f"📦 Cerebras model: {settings.CEREBRAS_MODEL}")
+    elif resolved == "ollama":
         logger.info(f"🤖 LLM provider: Ollama (local)")
         logger.info(f"📦 Ollama model: {settings.OLLAMA_MODEL}")
         logger.info(f"🔗 Ollama URL: {settings.OLLAMA_URL}")
-    elif settings.LLM_PROVIDER.lower() == "qwen":
+    elif resolved == "qwen":
         logger.info(f"🤖 LLM provider: Qwen (cloud)")
         logger.info(f"📦 Qwen model: {settings.QWEN_MODEL}")
         logger.info(f"🔗 Qwen API: {settings.QWEN_API_BASE}")
