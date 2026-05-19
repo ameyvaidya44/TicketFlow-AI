@@ -43,7 +43,8 @@ deep-translator==1.11.4
 
 # ─── Transformers / Sentiment ─────────────────────────────────────────
 transformers==4.41.0
-torch==2.3.0
+# CPU-only torch wheel — specified in build.sh to use the correct index URL
+torch==2.3.0+cpu
 tokenizers==0.19.1
 
 # ─── Vector Database ──────────────────────────────────────────────────
