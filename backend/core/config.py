@@ -42,23 +42,45 @@ class Settings(BaseSettings):
     UPSTASH_REDIS_REST_TOKEN: str = Field(default="", env="UPSTASH_REDIS_REST_TOKEN")
 
     # ─── LLM Provider ─────────────────────────────────────────────────
-    # "ollama" for local dev, "qwen" for production
-    LLM_PROVIDER: str = Field(default="ollama", env="LLM_PROVIDER")
+    # "auto"     → use cerebras if CEREBRAS_API_KEY is set, else ollama (default)
+    # "cerebras" → Cerebras Inference API (fast, cloud)
+    # "ollama"   → local Ollama (dev)
+    # "qwen"     → Qwen / DashScope (production alternative)
+    LLM_PROVIDER: str = Field(default="auto", env="LLM_PROVIDER")
 
-    # ─── Ollama (local dev) ───────────────────────────────────────────
+    # ─── Cerebras (preferred cloud provider) ─────────────────────────
+    CEREBRAS_API_KEY: str = Field(default="", env="CEREBRAS_API_KEY")
+    CEREBRAS_MODEL: str = Field(default="llama-3.3-70b", env="CEREBRAS_MODEL")
+
+    # ─── Ollama (local dev fallback) ─────────────────────────────────
     OLLAMA_URL: str = Field(default="http://localhost:11434", env="OLLAMA_URL")
     OLLAMA_MODEL: str = Field(default="mistral-nemo", env="OLLAMA_MODEL")
-    # OLLAMA_MODEL: str = Field(default="qwen2.5-coder:7b", env="OLLAMA_MODEL")
     OLLAMA_TEMPERATURE: float = 0.3
     OLLAMA_MAX_TOKENS: int = 250
 
-    # ─── Qwen (production) ────────────────────────────────────────────
+    # ─── Qwen (production alternative) ───────────────────────────────
     QWEN_API_KEY: str = Field(default="", env="QWEN_API_KEY")
     QWEN_MODEL: str = Field(default="qwen-plus", env="QWEN_MODEL")
     QWEN_API_BASE: str = Field(
         default="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         env="QWEN_API_BASE",
     )
+
+    @property
+    def resolved_llm_provider(self) -> str:
+        """
+        Resolve the effective LLM provider name.
+
+        "auto" logic:
+          - If CEREBRAS_API_KEY is set  → "cerebras"
+          - Else                        → "ollama"
+
+        Explicit values ("cerebras", "ollama", "qwen") are returned as-is.
+        """
+        provider = self.LLM_PROVIDER.lower().strip()
+        if provider == "auto":
+            return "cerebras" if self.CEREBRAS_API_KEY else "ollama"
+        return provider
 
     # ─── ChromaDB ─────────────────────────────────────────────────────
     CHROMA_HOST: str = Field(default="localhost", env="CHROMA_HOST")

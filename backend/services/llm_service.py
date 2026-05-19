@@ -83,7 +83,10 @@ class LLMService:
     @property
     def model(self) -> str:
         """Human-readable model name for logging/storage."""
-        if settings.LLM_PROVIDER.lower() == "qwen":
+        provider = settings.resolved_llm_provider
+        if provider == "cerebras":
+            return settings.CEREBRAS_MODEL
+        if provider == "qwen":
             return settings.QWEN_MODEL
         return settings.OLLAMA_MODEL
 
