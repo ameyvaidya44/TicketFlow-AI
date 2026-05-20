@@ -48,6 +48,7 @@ export default function Dashboard() {
   const [data,    setData]    = useState(null);
   const [volume,  setVolume]  = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error,   setError]   = useState(false);
   const { liveTickets, alerts, slaWarnings } = useNotifications();
   const navigate = useNavigate();
 
@@ -58,10 +59,30 @@ export default function Dashboard() {
     ]).then(([ovRes, volRes]) => {
       setData(ovRes.data);
       setVolume(volRes.data.volume || []);
-    }).catch(() => {}).finally(() => setLoading(false));
+    }).catch(() => setError(true)).finally(() => setLoading(false));
   }, []);
 
   if (loading) return <Loader text="Loading dashboard…" />;
+
+  if (error || !data) return (
+    <div className="flex flex-col items-center justify-center h-64 gap-4 text-center">
+      <AlertTriangle size={32} className="text-amber-400" />
+      <div>
+        <p className="text-gray-300 font-medium">Could not reach the backend</p>
+        <p className="text-gray-500 text-sm mt-1">The server may be waking up — this takes ~30s on free tier.</p>
+      </div>
+      <button
+        className="btn-primary mt-2"
+        onClick={() => { setError(false); setLoading(true);
+          Promise.all([analyticsAPI.overview(), analyticsAPI.ticketVolume(14)])
+            .then(([ovRes, volRes]) => { setData(ovRes.data); setVolume(volRes.data.volume || []); })
+            .catch(() => setError(true)).finally(() => setLoading(false));
+        }}
+      >
+        Retry
+      </button>
+    </div>
+  );
 
   const routingData = Object.entries(data?.routing_breakdown || {}).map(([name, value]) => ({
     name: name === "AUTO_RESOLVE" ? "Auto" : name === "SUGGEST_TO_AGENT" ? "Suggest" : "Escalate",
