@@ -28,7 +28,15 @@ export default function Register() {
       toast.success("Account created! Please log in.");
       navigate("/login");
     } catch (err) {
-      toast.error(err.response?.data?.detail || "Registration failed");
+      // Pydantic 422 returns detail as an array of {msg, loc, ...} objects
+      const detail = err.response?.data?.detail;
+      let message = "Registration failed";
+      if (typeof detail === "string") {
+        message = detail;
+      } else if (Array.isArray(detail) && detail.length > 0) {
+        message = detail[0].msg || message;
+      }
+      toast.error(message);
     } finally {
       setLoading(false);
     }

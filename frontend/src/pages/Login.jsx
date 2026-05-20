@@ -22,7 +22,13 @@ export default function Login() {
       toast.success("Welcome back!");
       navigate("/dashboard");
     } catch (err) {
-      toast.error(err.response?.data?.detail || "Invalid credentials");
+      const detail = err.response?.data?.detail;
+      const message = typeof detail === "string"
+        ? detail
+        : Array.isArray(detail) && detail.length > 0
+          ? detail[0].msg
+          : "Invalid credentials";
+      toast.error(message);
     } finally {
       setLoading(false);
     }
@@ -104,9 +110,9 @@ export default function Login() {
             <p className="text-xs text-gray-500 text-center mb-3">Demo accounts</p>
             <div className="grid grid-cols-3 gap-2">
               {[
-                { label: "User",  email: "user@demo.com",  password: "demo1234" },
-                { label: "Agent", email: "agent@demo.com", password: "demo1234" },
-                { label: "Admin", email: "admin@demo.com", password: "demo1234" },
+                { label: "User",  email: "user@ticketflow.ai",  password: "user123" },
+                { label: "Agent", email: "agent1@ticketflow.ai", password: "agent123" },
+                { label: "Admin", email: "admin@ticketflow.ai", password: "admin123" },
               ].map((demo) => (
                 <button
                   key={demo.label}
